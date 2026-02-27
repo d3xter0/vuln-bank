@@ -195,80 +195,86 @@ def index():
 def register():
     if request.method == 'POST':
         try:
-            # Mass Assignment Vulnerability - Client can send additional parameters
-            user_data = request.get_json()  # Changed to get_json()
+            # Vulnerability: Mass Assignment (no filtering)
+            user_data = request.get_json()
             account_number = generate_account_number()
-            
-            # Check if username exists
-            existing_user = execute_query(
-                "SELECT username FROM users WHERE username = %s",
+
+            # Vulnerability: Weak existence check (possible enumeration)
+            existing = execute_query(
+                "SELECT id FROM users WHERE username = %s",
                 (user_data.get('username'),)
             )
-            
-            if existing_user and existing_user[0]:
+
+            if existing:
                 return jsonify({
                     'status': 'error',
-                    'message': 'Username already exists',
-                    'username': user_data.get('username'),
-                    'tried_at': str(datetime.now())  # Information disclosure
+                    'message': 'User already exists',
+                    'attempted_username': user_data.get('username'),
+                    'server_time': str(datetime.now())
                 }), 400
-            
-            # Build dynamic query based on user input fields
-            # Vulnerability: Mass Assignment possible here
+
+            # Build dynamic fields from client input
             fields = ['username', 'password', 'account_number']
-            values = [user_data.get('username'), user_data.get('password'), account_number]
-            
-            # Include any additional parameters from user input
+            values = [
+                user_data.get('username'),
+                user_data.get('password'),
+                account_number
+            ]
+
+            # Vulnerability: Allow any additional client-supplied field
             for key, value in user_data.items():
                 if key not in ['username', 'password']:
                     fields.append(key)
                     values.append(value)
-            
-            # Build the SQL query dynamically
+
+            # Dynamic SQL construction
             query = f"""
                 INSERT INTO users ({', '.join(fields)})
                 VALUES ({', '.join(['%s'] * len(fields))})
-                RETURNING id, username, account_number, balance, is_admin
+                RETURNING *
             """
-            
+
             result = execute_query(query, values, fetch=True)
-            
-            if not result or not result[0]:
-                raise Exception("Failed to create user")
-                
-            user = result[0]
-            
-            # Excessive Data Exposure in Response
-            sensitive_data = {
+
+            if not result:
+                raise Exception("User creation failed")
+
+            new_user = result[0]
+
+            # Vulnerability: Sensitive data exposure
+            response_data = {
                 'status': 'success',
-                'message': 'Registration successful! Proceed to login',
-                'debug_data': {  # Sensitive data exposed
-                    'user_id': user[0],
-                    'username': user[1],
-                    'account_number': user[2],
-                    'balance': float(user[3]) if user[3] else 1000.0,
-                    'is_admin': user[4],
-                    'registration_time': str(datetime.now()),
-                    'server_info': request.headers.get('User-Agent'),
-                    'raw_data': user_data,  # Exposing raw input data
-                    'fields_registered': fields  # Show what fields were registered
+                'message': 'User created successfully',
+                'user_info': {
+                    'id': new_user[0],
+                    'username': new_user[1],
+                    'account_number': new_user[3],
+                    'balance': float(new_user[4]) if new_user[4] else 0.0,
+                    'is_admin': new_user[5],
+                    'raw_input': user_data,  # exposing full client input
+                    'registered_fields': fields,
+                    'registration_timestamp': str(datetime.now())
                 }
             }
-            
-            response = jsonify(sensitive_data)
-            response.headers['X-Debug-Info'] = str(sensitive_data['debug_data'])
-            response.headers['X-User-Info'] = f"id={user[0]};admin={user[4]};balance={user[3]}"
-            
+
+            response = jsonify(response_data)
+
+            # Vulnerability: Sensitive info in headers
+            response.headers['X-Internal-User'] = str(response_data['user_info'])
+            response.headers['X-Account-Number'] = str(new_user[3])
+
             return response
-                
+
         except Exception as e:
-            print(f"Registration error: {str(e)}")
             return jsonify({
                 'status': 'error',
-                'message': 'Registration failed',
-                'error': str(e)
+                'message': str(e),
+                'debug': {
+                    'input_data': request.get_json(),
+                    'error_type': type(e)._name_
+                }
             }), 500
-        
+
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -276,32 +282,40 @@ def login():
     if request.method == 'POST':
         try:
             data = request.get_json()
+
+            # Handle case if no JSON sent (avoid NoneType crash)
+            if not data:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'No input data provided'
+                }), 400
+
             username = data.get('username')
             password = data.get('password')
-            
+
             print(f"Login attempt - Username: {username}")  # Debug print
-            
+
             # SQL Injection vulnerability (intentionally vulnerable)
             query = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
             print(f"Debug - Login query: {query}")  # Debug print
-            
+
             user = execute_query(query)
             print(f"Debug - Query result: {user}")  # Debug print
-            
+
             if user and len(user) > 0:
                 user = user[0]  # Get first row
                 print(f"Debug - Found user: {user}")  # Debug print
-                
-                # Generate JWT token instead of using session
+
+                # Generate JWT token
                 token = generate_token(user[0], user[1], user[5])
                 print(f"Debug - Generated token: {token}")  # Debug print
-                
+
                 response = make_response(jsonify({
                     'status': 'success',
                     'message': 'Login successful',
                     'token': token,
                     'accountNumber': user[3],
-                    'isAdmin':       user[5],
+                    'isAdmin': user[5],
                     'debug_info': {  # Vulnerability: Information disclosure
                         'user_id': user[0],
                         'username': user[1],
@@ -310,28 +324,30 @@ def login():
                         'login_time': str(datetime.now())
                     }
                 }))
+
                 # Vulnerability: Cookie without secure flag
                 response.set_cookie('token', token, httponly=True)
+
                 return response
-            
+
             # Vulnerability: Username enumeration
             return jsonify({
                 'status': 'error',
                 'message': 'Invalid credentials',
-                'debug_info': {  # Vulnerability: Information disclosure
+                'debug_info': {
                     'attempted_username': username,
                     'time': str(datetime.now())
                 }
             }), 401
-            
+
         except Exception as e:
             print(f"Login error: {str(e)}")
             return jsonify({
                 'status': 'error',
                 'message': 'Login failed',
-                'error': str(e)
+                'error': str(e)  # Detailed error exposure
             }), 500
-        
+
     return render_template('login.html')
 
 @app.route('/debug/users')
@@ -413,66 +429,73 @@ def check_balance(account_number):
 @token_required
 def transfer(current_user):
     try:
-        data = request.get_json()
-        # Vulnerability: No input validation on amount
-        # Vulnerability: Negative amounts allowed
-        amount = float(data.get('amount'))
-        to_account = data.get('to_account')
-        
-        # Get sender's account number
-        # Race condition vulnerability in checking balance
-        sender_data = execute_query(
+        payload = request.get_json()
+
+        # Still vulnerable: no proper validation
+        transfer_amount = float(payload.get('amount'))
+        receiver_account = payload.get('to_account')
+        note = payload.get('description', 'Transfer')
+
+        # Fetch sender info (still race condition vulnerable)
+        user_record = execute_query(
             "SELECT account_number, balance FROM users WHERE id = %s",
             (current_user['user_id'],)
-        )[0]
-        
-        from_account = sender_data[0]
-        balance = float(sender_data[1])
-        
-        if balance >= abs(amount):  # Check against absolute value of amount
+        )
+
+        if not user_record:
+            return jsonify({
+                'status': 'error',
+                'message': 'User not found'
+            }), 404
+
+        sender_account, current_balance = user_record[0]
+        current_balance = float(current_balance)
+
+        # Same flawed balance check logic
+        if current_balance >= abs(transfer_amount):
+
+            operations = [
+                (
+                    "UPDATE users SET balance = balance - %s WHERE id = %s",
+                    (transfer_amount, current_user['user_id'])
+                ),
+                (
+                    "UPDATE users SET balance = balance + %s WHERE account_number = %s",
+                    (transfer_amount, receiver_account)
+                ),
+                (
+                    """INSERT INTO transactions 
+                       (from_account, to_account, amount, transaction_type, description)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (sender_account, receiver_account, transfer_amount, 'transfer', note)
+                )
+            ]
+
             try:
-                # Vulnerability: Negative transfers possible
-                # Vulnerability: No transaction atomicity
-                queries = [
-                    (
-                        "UPDATE users SET balance = balance - %s WHERE id = %s",
-                        (amount, current_user['user_id'])
-                    ),
-                    (
-                        "UPDATE users SET balance = balance + %s WHERE account_number = %s",
-                        (amount, to_account)
-                    ),
-                    (
-                        """INSERT INTO transactions 
-                           (from_account, to_account, amount, transaction_type, description)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (from_account, to_account, amount, 'transfer', 
-                         data.get('description', 'Transfer'))
-                    )
-                ]
-                execute_transaction(queries)
-                
+                # Still no true atomicity protection (same vulnerability)
+                execute_transaction(operations)
+
                 return jsonify({
                     'status': 'success',
-                    'message': 'Transfer Completed',
-                    'new_balance': balance - amount
+                    'message': 'Transfer successful',
+                    'updated_balance': current_balance - transfer_amount
                 })
-                
-            except Exception as e:
+
+            except Exception as db_error:
                 return jsonify({
                     'status': 'error',
-                    'message': str(e)
+                    'message': str(db_error)
                 }), 500
         else:
             return jsonify({
                 'status': 'error',
-                'message': 'Insufficient funds'
+                'message': 'Insufficient balance'
             }), 400
-            
-    except Exception as e:
+
+    except Exception as ex:
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': str(ex)
         }), 500
 
 # Get transaction history endpoint
@@ -1402,123 +1425,124 @@ def api_transactions(current_user):
 @token_required
 def create_virtual_card(current_user):
     try:
-        data = request.get_json()
-        
-        # Vulnerability: No validation on card limit
-        card_limit = float(data.get('card_limit', 1000.0))
-        
-        # Generate card details
-        card_number = generate_card_number()
-        cvv = generate_cvv()
-        # Vulnerability: Fixed expiry date calculation
-        expiry_date = (datetime.now() + timedelta(days=365)).strftime('%m/%y')
-        
-        # Vulnerability: SQL injection possible in card_type
-        card_type = data.get('card_type', 'standard')
-        
-        # Create virtual card
-        query = f"""
-            INSERT INTO virtual_cards 
+        payload = request.get_json()
+
+        # Still vulnerable: no validation on limit
+        limit_value = float(payload.get('card_limit', 1000.0))
+
+        generated_number = generate_card_number()
+        generated_cvv = generate_cvv()
+
+        # Still fixed expiry logic
+        exp_date = (datetime.now() + timedelta(days=365)).strftime('%m/%y')
+
+        # Still SQL injection vulnerable
+        type_value = payload.get('card_type', 'standard')
+
+        insert_query = f"""
+            INSERT INTO virtual_cards
             (user_id, card_number, cvv, expiry_date, card_limit, card_type)
-            VALUES 
-            ({current_user['user_id']}, '{card_number}', '{cvv}', '{expiry_date}', {card_limit}, '{card_type}')
+            VALUES
+            ({current_user['user_id']}, '{generated_number}', '{generated_cvv}',
+             '{exp_date}', {limit_value}, '{type_value}')
             RETURNING id
         """
-        
-        result = execute_query(query)
-        
-        if result:
-            # Vulnerability: Sensitive data exposure
+
+        created = execute_query(insert_query)
+
+        if created:
             return jsonify({
                 'status': 'success',
-                'message': 'Virtual card created successfully',
-                'card_details': {
-                    'card_number': card_number,
-                    'cvv': cvv,
-                    'expiry_date': expiry_date,
-                    'limit': card_limit,
-                    'type': card_type
+                'message': 'Virtual card created',
+                'card_info': {
+                    'number': generated_number,
+                    'cvv': generated_cvv,
+                    'expiry': exp_date,
+                    'limit': limit_value,
+                    'type': type_value
                 }
             })
-            
+
         return jsonify({
             'status': 'error',
-            'message': 'Failed to create virtual card'
+            'message': 'Creation failed'
         }), 500
-        
-    except Exception as e:
-        # Vulnerability: Detailed error exposure
+
+    except Exception as err:
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': str(err)
         }), 500
 
 @app.route('/api/virtual-cards', methods=['GET'])
 @token_required
-def get_virtual_cards(current_user):
+def list_virtual_cards(current_user):
     try:
-        # Vulnerability: No pagination
-        query = f"""
-            SELECT * FROM virtual_cards 
+        # Still no pagination & SQL injection style formatting
+        fetch_query = f"""
+            SELECT * FROM virtual_cards
             WHERE user_id = {current_user['user_id']}
         """
-        
-        cards = execute_query(query)
-        
-        # Vulnerability: Sensitive data exposure
+
+        results = execute_query(fetch_query)
+
+        cards_data = []
+        for row in results:
+            cards_data.append({
+                'id': row[0],
+                'card_number': row[2],
+                'cvv': row[3],
+                'expiry_date': row[4],
+                'limit': float(row[5]),
+                'balance': float(row[6]),
+                'is_frozen': row[7],
+                'is_active': row[8],
+                'created_at': str(row[9]),
+                'last_used_at': str(row[10]) if row[10] else None,
+                'card_type': row[11]
+            })
+
         return jsonify({
             'status': 'success',
-            'cards': [{
-                'id': card[0],
-                'card_number': card[2],
-                'cvv': card[3],
-                'expiry_date': card[4],
-                'limit': float(card[5]),
-                'balance': float(card[6]),
-                'is_frozen': card[7],
-                'is_active': card[8],
-                'created_at': str(card[9]),
-                'last_used_at': str(card[10]) if card[10] else None,
-                'card_type': card[11]
-            } for card in cards]
+            'cards': cards_data
         })
-        
-    except Exception as e:
+
+    except Exception as err:
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': str(err)
         }), 500
 
 @app.route('/api/virtual-cards/<int:card_id>/toggle-freeze', methods=['POST'])
 @token_required
-def toggle_card_freeze(current_user, card_id):
+def change_card_freeze(current_user, card_id):
     try:
-        # Vulnerability: No CSRF protection
-        # Vulnerability: BOLA - no verification if card belongs to user
-        query = f"""
-            UPDATE virtual_cards 
-            SET is_frozen = NOT is_frozen 
+        # Still no ownership verification (BOLA)
+        toggle_query = f"""
+            UPDATE virtual_cards
+            SET is_frozen = NOT is_frozen
             WHERE id = {card_id}
             RETURNING is_frozen
         """
-        
-        result = execute_query(query)
-        
-        if result:
+
+        update_result = execute_query(toggle_query)
+
+        if update_result:
+            state = update_result[0][0]
             return jsonify({
                 'status': 'success',
-                'message': f"Card {'frozen' if result[0][0] else 'unfrozen'} successfully"
+                'message': f"Card {'frozen' if state else 'unfrozen'}"
             })
-            
+
         return jsonify({
             'status': 'error',
-            'message': 'Card not found'
+            'message': 'Card does not exist'
         }), 404
-        
-    except Exception as e:
+
+    except Exception as err:
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': str(err)
         }), 500
 
 @app.route('/api/virtual-cards/<int:card_id>/transactions', methods=['GET'])
